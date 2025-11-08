@@ -35,7 +35,7 @@ CFG = {
     'IMG_SIZE': 384,
     'EPOCHS': 50,
     'BATCH_SIZE': 32,
-    'LR': 1e-4,
+    'LR': 5e-5,
     'SEED': 42,
     'NUM_CLASSES': 17,
     'N_FOLDS': 5,
