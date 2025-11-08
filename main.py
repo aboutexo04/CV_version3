@@ -3,11 +3,13 @@ import random
 import numpy as np
 import pandas as pd
 from PIL import Image
+import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 import timm
 from tqdm import tqdm
 from sklearn.model_selection import StratifiedKFold
@@ -38,11 +40,11 @@ CFG = {
     'NUM_CLASSES': 17,
     'N_FOLDS': 5,
     'PATIENCE': 10,  # Early Stopping patience
-    'MODEL_NAME': 'vit_base_patch16_384',  # ViT-Base model
+    'MODEL_NAME': 'convnext_base.fb_in22k_ft_in1k',  # ConvNeXt-Base model
     'DEVICE': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
-# Dataset 정의
+# Dataset 정의 (Albumentations 사용)
 class DocumentDataset(Dataset):
     def __init__(self, df, img_dir, transform=None):
         self.df = df
@@ -54,42 +56,58 @@ class DocumentDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = os.path.join(self.img_dir, self.df.iloc[idx]['ID'])
-        image = Image.open(img_path).convert('RGB')
+        image = np.array(Image.open(img_path).convert('RGB'))
 
         if self.transform:
-            image = self.transform(image)
+            image = self.transform(image=image)['image']
 
         label = self.df.iloc[idx]['target']
         return image, label
 
-# ResNet50 최적화 증강 (main_Resnet50.py에서 가져옴)
-train_transform = transforms.Compose([
-    transforms.Resize((CFG['IMG_SIZE'], CFG['IMG_SIZE'])),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomVerticalFlip(p=0.5),
-    transforms.RandomRotation(degrees=180, fill=255),  # p=0.8 효과 (항상 적용하되 각도 랜덤)
-    transforms.RandomAffine(
-        degrees=45,  # ShiftScaleRotate의 rotate_limit
-        translate=(0.1, 0.1),  # shift_limit=0.1
-        scale=(0.8, 1.2),  # scale_limit=0.2 (1±0.2)
-        fill=255  # 흰색 배경
+# ViT Winner 증강 (train_vit_base_384_WINNER.py에서 가져옴)
+train_transform = A.Compose([
+    A.Resize(height=CFG['IMG_SIZE'], width=CFG['IMG_SIZE']),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.Rotate(limit=180, p=0.8, border_mode=cv2.BORDER_CONSTANT, value=(255, 255, 255)),
+    A.ShiftScaleRotate(
+        shift_limit=0.1,
+        scale_limit=0.15,
+        rotate_limit=30,
+        p=0.6,
+        border_mode=cv2.BORDER_CONSTANT,
+        value=(255, 255, 255)
     ),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),  # RandomBrightnessContrast
-    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),  # Blur 대체 (p 효과는 RandomApply로 가능)
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    A.OneOf([
+        A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=1.0),
+        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=1.0),
+    ], p=0.5),
+    A.OneOf([
+        A.GaussNoise(var_limit=(10.0, 30.0), p=1.0),
+        A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+    ], p=0.3),
+    A.CoarseDropout(
+        max_holes=8,
+        max_height=32,
+        max_width=32,
+        min_holes=1,
+        fill_value=255,
+        p=0.3
+    ),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
 ])
 
-val_transform = transforms.Compose([
-    transforms.Resize((CFG['IMG_SIZE'], CFG['IMG_SIZE'])),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+val_transform = A.Compose([
+    A.Resize(height=CFG['IMG_SIZE'], width=CFG['IMG_SIZE']),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
 ])
 
-test_transform = transforms.Compose([
-    transforms.Resize((CFG['IMG_SIZE'], CFG['IMG_SIZE'])),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+test_transform = A.Compose([
+    A.Resize(height=CFG['IMG_SIZE'], width=CFG['IMG_SIZE']),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
 ])
 
 # 모델 정의
@@ -359,9 +377,9 @@ def main():
 
             def __getitem__(self, idx):
                 img_path = os.path.join(self.img_dir, self.file_list[idx])
-                image = Image.open(img_path).convert('RGB')
+                image = np.array(Image.open(img_path).convert('RGB'))
                 if self.transform:
-                    image = self.transform(image)
+                    image = self.transform(image=image)['image']
                 return image
 
         test_dataset = TestDataset(test_files, './data/test', transform=test_transform)
