@@ -88,8 +88,8 @@ CFG = {
     'WARMUP_EPOCHS': 2,  # Warmup before applying mixup/cutmix
     'MODEL_NAME': 'convnext_base.fb_in22k_ft_in1k',  # ConvNeXt-Base model
     'DEVICE': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'DROP_RATE': 0.1,  # Dropout rate
-    'DROP_PATH_RATE': 0.1,  # Drop path rate
+    'DROP_RATE': 0.0,  # Dropout rate (disabled)
+    'DROP_PATH_RATE': 0.0,  # Drop path rate (disabled)
     'LABEL_SMOOTHING': 0.1,  # Label smoothing
 }
 
