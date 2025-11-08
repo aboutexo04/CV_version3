@@ -62,16 +62,20 @@ class DocumentDataset(Dataset):
         label = self.df.iloc[idx]['target']
         return image, label
 
-# 강한 데이터 증강 (테스트 데이터에 180도 회전 등 강한 증강이 적용되어 있음을 고려)
+# ResNet50 최적화 증강 (main_Resnet50.py에서 가져옴)
 train_transform = transforms.Compose([
     transforms.Resize((CFG['IMG_SIZE'], CFG['IMG_SIZE'])),
     transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomVerticalFlip(p=0.4),
-    transforms.RandomRotation(degrees=180),  # 180도 회전 포함
-    transforms.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.12),
-    transforms.RandomAffine(degrees=0, translate=(0.12, 0.12), scale=(0.88, 1.12), shear=8),
-    transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
-    transforms.RandomGrayscale(p=0.05),  # 문서는 흑백도 많음
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=180, fill=255),  # p=0.8 효과 (항상 적용하되 각도 랜덤)
+    transforms.RandomAffine(
+        degrees=45,  # ShiftScaleRotate의 rotate_limit
+        translate=(0.1, 0.1),  # shift_limit=0.1
+        scale=(0.8, 1.2),  # scale_limit=0.2 (1±0.2)
+        fill=255  # 흰색 배경
+    ),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),  # RandomBrightnessContrast
+    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),  # Blur 대체 (p 효과는 RandomApply로 가능)
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
