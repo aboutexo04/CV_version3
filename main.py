@@ -25,23 +25,72 @@ def seed_everything(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 seed_everything(42)
 
-# 하이퍼파라미터 설정
+# ==================== Mixup/CutMix Functions ====================
+def rand_bbox(size, lam):
+    """Generate random bounding box for CutMix"""
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
+
+def mixup_cutmix_data(x, y, alpha=1.0, cutmix_prob=0.5):
+    """Apply mixup or cutmix augmentation"""
+    if alpha <= 0 or np.random.rand() > 0.8:
+        return x, y, y, 1.0
+
+    lam = np.random.beta(alpha, alpha)
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+
+    # CutMix
+    if np.random.rand() < cutmix_prob:
+        bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+        x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
+        lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+    # Mixup
+    else:
+        x = lam * x + (1 - lam) * x[index, :]
+
+    y_a, y_b = y, y[index]
+    return x, y_a, y_b, lam
+
+def mixed_criterion(criterion, pred, y_a, y_b, lam):
+    """Calculate mixed loss for mixup/cutmix"""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+# 하이퍼파라미터 설정 (ViT Winner 기반 개선)
 CFG = {
     'IMG_SIZE': 384,
-    'EPOCHS': 50,
-    'BATCH_SIZE': 32,
-    'LR': 5e-5,
+    'EPOCHS': 40,
+    'BATCH_SIZE': 8,  # Smaller batch for gradient accumulation
+    'GRADIENT_ACCUMULATION': 4,  # Effective batch = 8 * 4 = 32
+    'LR': 3e-5,  # Conservative LR from winner config
     'SEED': 42,
     'NUM_CLASSES': 17,
     'N_FOLDS': 5,
-    'PATIENCE': 10,  # Early Stopping patience
+    'PATIENCE': 12,  # Increased patience for better convergence
+    'WARMUP_EPOCHS': 2,  # Warmup before applying mixup/cutmix
     'MODEL_NAME': 'convnext_base.fb_in22k_ft_in1k',  # ConvNeXt-Base model
-    'DEVICE': 'cuda' if torch.cuda.is_available() else 'cpu'
+    'DEVICE': 'cuda' if torch.cuda.is_available() else 'cpu',
+    'DROP_RATE': 0.1,  # Dropout rate
+    'DROP_PATH_RATE': 0.1,  # Drop path rate
+    'LABEL_SMOOTHING': 0.1,  # Label smoothing
 }
 
 # Dataset 정의 (Albumentations 사용)
@@ -110,28 +159,55 @@ test_transform = A.Compose([
     ToTensorV2(),
 ])
 
-# 모델 정의
+# 모델 정의 (Dropout & Drop Path 적용)
 def get_model(num_classes=CFG['NUM_CLASSES']):
-    model = timm.create_model(CFG['MODEL_NAME'], pretrained=True, num_classes=num_classes)
+    model = timm.create_model(
+        CFG['MODEL_NAME'],
+        pretrained=True,
+        num_classes=num_classes,
+        drop_rate=CFG['DROP_RATE'],
+        drop_path_rate=CFG['DROP_PATH_RATE']
+    )
     return model
 
-# 학습 함수
-def train_epoch(model, dataloader, criterion, optimizer, device):
+# 학습 함수 (Mixed Precision + Gradient Accumulation + Mixup/CutMix)
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler, epoch, use_mixup=True):
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
 
-    for images, labels in dataloader:
+    optimizer.zero_grad()
+
+    for batch_idx, (images, labels) in enumerate(dataloader):
         images, labels = images.to(device), labels.to(device)
 
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        # Apply mixup/cutmix after warmup epochs
+        if use_mixup:
+            mixed_images, labels_a, labels_b, lam = mixup_cutmix_data(
+                images, labels, alpha=0.4, cutmix_prob=0.5
+            )
+        else:
+            mixed_images, labels_a, labels_b, lam = images, labels, labels, 1.0
 
-        running_loss += loss.item()
+        # Mixed precision training
+        with torch.cuda.amp.autocast():
+            outputs = model(mixed_images)
+            loss = mixed_criterion(criterion, outputs, labels_a, labels_b, lam)
+            loss = loss / CFG['GRADIENT_ACCUMULATION']
+
+        # Backward with gradient scaling
+        scaler.scale(loss).backward()
+
+        # Gradient accumulation
+        if (batch_idx + 1) % CFG['GRADIENT_ACCUMULATION'] == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        running_loss += loss.item() * CFG['GRADIENT_ACCUMULATION']
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
@@ -140,7 +216,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     epoch_acc = 100. * correct / total
     return epoch_loss, epoch_acc
 
-# 검증 함수
+# 검증 함수 (Mixed Precision)
 def validate_epoch(model, dataloader, criterion, device):
     model.eval()
     running_loss = 0.0
@@ -151,8 +227,9 @@ def validate_epoch(model, dataloader, criterion, device):
         for images, labels in dataloader:
             images, labels = images.to(device), labels.to(device)
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
             running_loss += loss.item()
             _, predicted = outputs.max(1)
@@ -163,7 +240,7 @@ def validate_epoch(model, dataloader, criterion, device):
     epoch_acc = 100. * correct / total
     return epoch_loss, epoch_acc
 
-# 예측 함수
+# 예측 함수 (Mixed Precision)
 def predict(model, dataloader, device):
     model.eval()
     predictions = []
@@ -172,7 +249,8 @@ def predict(model, dataloader, device):
         pbar = tqdm(dataloader, desc='Predicting')
         for images in pbar:
             images = images.to(device)
-            outputs = model(images)
+            with torch.cuda.amp.autocast():
+                outputs = model(images)
             _, predicted = outputs.max(1)
             predictions.extend(predicted.cpu().numpy())
 
@@ -292,14 +370,19 @@ def main():
             pin_memory=True
         )
 
-        # 모델, 손실함수, 옵티마이저 설정
+        # 모델, 손실함수, 옵티마이저, 스케줄러 설정 (ViT Winner 기반)
         model = get_model().to(CFG['DEVICE'])
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=CFG['LR'])
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG['EPOCHS'], eta_min=1e-6)
+        criterion = nn.CrossEntropyLoss(label_smoothing=CFG['LABEL_SMOOTHING'])  # Label smoothing
+        optimizer = optim.AdamW(model.parameters(), lr=CFG['LR'], weight_decay=0.01)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-7)
+
+        # Mixed precision scaler
+        scaler = torch.cuda.amp.GradScaler()
 
         # 학습
         logger.info(f"Starting training for Fold {fold}...")
+        logger.info(f"  - Effective batch size: {CFG['BATCH_SIZE'] * CFG['GRADIENT_ACCUMULATION']}")
+        logger.info(f"  - Mixup/CutMix starts after epoch {CFG['WARMUP_EPOCHS']}")
         best_val_acc = 0.0
         patience_counter = 0
 
@@ -307,7 +390,11 @@ def main():
             logger.info(f"\nFold {fold} - Epoch {epoch+1}/{CFG['EPOCHS']}")
             logger.info("-" * 50)
 
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, CFG['DEVICE'])
+            # Apply mixup/cutmix after warmup
+            use_mixup = epoch >= CFG['WARMUP_EPOCHS']
+            train_loss, train_acc = train_epoch(
+                model, train_loader, criterion, optimizer, CFG['DEVICE'], scaler, epoch, use_mixup
+            )
             val_loss, val_acc = validate_epoch(model, val_loader, criterion, CFG['DEVICE'])
             scheduler.step()
 
