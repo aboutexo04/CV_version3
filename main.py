@@ -38,7 +38,7 @@ CFG = {
     'NUM_CLASSES': 17,
     'N_FOLDS': 5,
     'PATIENCE': 10,  # Early Stopping patience
-    'MODEL_NAME': 'convnext_small.fb_in22k_ft_in1k',
+    'MODEL_NAME': 'vit_base_patch16_384',  # ViT-Base model
     'DEVICE': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
