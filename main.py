@@ -1,38 +1,110 @@
+"""
+Vision Transformer Base 384 - Optimized for Document Classification
+주요 개선사항:
+1. TTA (Test Time Augmentation) 추가 → 안정적인 예측
+2. Focal Loss → 클래스 불균형 직접 대응
+3. Dropout 조정 → 과적합 방지
+4. Better validation strategy
+5. Ensemble with confidence weighting
+"""
+
 import os
+import time
 import random
-import numpy as np
-import pandas as pd
-from PIL import Image
+import pickle
 import cv2
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
 import timm
+import torch
+import albumentations as A
+import pandas as pd
+import numpy as np
+import torch.nn as nn
+from albumentations.pytorch import ToTensorV2
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 from tqdm import tqdm
+from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import f1_score
 from datetime import datetime
-import logging
-import sys
 
-# Seed 고정
-def seed_everything(seed=42):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+# ==================== Reproducibility ====================
+SEED = 42
+os.environ['PYTHONHASHSEED'] = str(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = True
 
-seed_everything(42)
+print("="*80)
+print("🚀 VISION TRANSFORMER BASE 384 - OPTIMIZED")
+print("="*80)
+print("\nKey Improvements:")
+print("  ✓ Test Time Augmentation (TTA)")
+print("  ✓ Focal Loss for class imbalance")
+print("  ✓ Confidence-weighted ensemble")
+print("  ✓ Better regularization")
+print("  ✓ Optimized training schedule")
+print("="*80)
 
-# ==================== Mixup/CutMix Functions ====================
+# ==================== Configuration ====================
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"\n[CONFIG] Device: {device}")
+
+# Model parameters
+model_name = 'vit_base_patch16_384'
+img_size = 384
+LR = 2e-5  # 더 보수적으로
+EPOCHS = 35  # 약간 줄임
+BATCH_SIZE = 8
+num_workers = 4
+n_splits = 5
+warmup_epochs = 3  # warmup 늘림
+gradient_accumulation_steps = 2
+
+# TTA settings
+TTA_TRANSFORMS = 5  # TTA 횟수
+
+# Paths
+train_csv = './data/train.csv'
+test_csv = './data/sample_submission.csv'
+train_folder = './data/train/'
+test_folder = './data/test/'
+model_save_path = './models_vit_base_384_opt/'
+
+os.makedirs(model_save_path, exist_ok=True)
+
+print(f"[CONFIG] Model: {model_name}")
+print(f"[CONFIG] Learning rate: {LR}")
+print(f"[CONFIG] TTA transforms: {TTA_TRANSFORMS}")
+
+# ==================== Focal Loss ====================
+class FocalLoss(nn.Module):
+    """클래스 불균형에 강한 Focal Loss"""
+    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        p_t = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - p_t) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+# ==================== Mixup/CutMix ====================
 def rand_bbox(size, lam):
-    """Generate random bounding box for CutMix"""
     W = size[2]
     H = size[3]
     cut_rat = np.sqrt(1. - lam)
@@ -50,20 +122,18 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 def mixup_cutmix_data(x, y, alpha=1.0, cutmix_prob=0.5):
-    """Apply mixup or cutmix augmentation"""
-    if alpha <= 0 or np.random.rand() > 0.8:
+    """Apply mixup or cutmix - 더 보수적으로"""
+    if alpha <= 0 or np.random.rand() > 0.7:  # 70%만 적용
         return x, y, y, 1.0
 
     lam = np.random.beta(alpha, alpha)
     batch_size = x.size()[0]
     index = torch.randperm(batch_size).to(x.device)
 
-    # CutMix
     if np.random.rand() < cutmix_prob:
         bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
         x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
         lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
-    # Mixup
     else:
         x = lam * x + (1 - lam) * x[index, :]
 
@@ -71,458 +141,395 @@ def mixup_cutmix_data(x, y, alpha=1.0, cutmix_prob=0.5):
     return x, y_a, y_b, lam
 
 def mixed_criterion(criterion, pred, y_a, y_b, lam):
-    """Calculate mixed loss for mixup/cutmix"""
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
-# 하이퍼파라미터 설정 (ViT Winner 기반 개선)
-CFG = {
-    'IMG_SIZE': 384,
-    'EPOCHS': 40,
-    'BATCH_SIZE': 8,  # Smaller batch for gradient accumulation
-    'GRADIENT_ACCUMULATION': 4,  # Effective batch = 8 * 4 = 32
-    'LR': 3e-5,  # Conservative LR from winner config
-    'SEED': 42,
-    'NUM_CLASSES': 17,
-    'N_FOLDS': 5,
-    'PATIENCE': 12,  # Increased patience for better convergence
-    'WARMUP_EPOCHS': 2,  # Warmup before applying mixup/cutmix
-    'MODEL_NAME': 'convnext_base.fb_in22k_ft_in1k',  # ConvNeXt-Base model
-    'DEVICE': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'DROP_RATE': 0.0,  # Dropout rate (disabled)
-    'DROP_PATH_RATE': 0.0,  # Drop path rate (disabled)
-    'LABEL_SMOOTHING': 0.1,  # Label smoothing
-}
-
-# Dataset 정의 (Albumentations 사용)
-class DocumentDataset(Dataset):
-    def __init__(self, df, img_dir, transform=None):
-        self.df = df
-        self.img_dir = img_dir
+# ==================== Dataset Class ====================
+class ImageDataset(Dataset):
+    def __init__(self, csv, path, transform=None):
+        self.df = pd.read_csv(csv).values
+        self.path = path
         self.transform = transform
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        img_path = os.path.join(self.img_dir, self.df.iloc[idx]['ID'])
-        image = np.array(Image.open(img_path).convert('RGB'))
-
+        name, target = self.df[idx]
+        img = np.array(Image.open(os.path.join(self.path, name)))
         if self.transform:
-            image = self.transform(image=image)['image']
+            img = self.transform(image=img)['image']
+        return img, int(target)
 
-        label = self.df.iloc[idx]['target']
-        return image, label
-
-# ViT Winner 증강 (train_vit_base_384_WINNER.py에서 가져옴)
-train_transform = A.Compose([
-    A.Resize(height=CFG['IMG_SIZE'], width=CFG['IMG_SIZE']),
-    A.HorizontalFlip(p=0.5),
-    A.VerticalFlip(p=0.5),
-    A.Rotate(limit=180, p=0.8, border_mode=cv2.BORDER_CONSTANT, value=(255, 255, 255)),
-    A.ShiftScaleRotate(
-        shift_limit=0.1,
-        scale_limit=0.15,
-        rotate_limit=30,
-        p=0.6,
-        border_mode=cv2.BORDER_CONSTANT,
-        value=(255, 255, 255)
-    ),
-    A.OneOf([
-        A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=1.0),
-        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=1.0),
-    ], p=0.5),
-    A.OneOf([
-        A.GaussNoise(var_limit=(10.0, 30.0), p=1.0),
-        A.GaussianBlur(blur_limit=(3, 5), p=1.0),
-    ], p=0.3),
-    A.CoarseDropout(
-        max_holes=8,
-        max_height=32,
-        max_width=32,
-        min_holes=1,
-        fill_value=255,
-        p=0.3
-    ),
-    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ToTensorV2(),
-])
-
-val_transform = A.Compose([
-    A.Resize(height=CFG['IMG_SIZE'], width=CFG['IMG_SIZE']),
-    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ToTensorV2(),
-])
-
-test_transform = A.Compose([
-    A.Resize(height=CFG['IMG_SIZE'], width=CFG['IMG_SIZE']),
-    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ToTensorV2(),
-])
-
-# 모델 정의 (Dropout & Drop Path 적용)
-def get_model(num_classes=CFG['NUM_CLASSES']):
-    model = timm.create_model(
-        CFG['MODEL_NAME'],
-        pretrained=True,
-        num_classes=num_classes,
-        drop_rate=CFG['DROP_RATE'],
-        drop_path_rate=CFG['DROP_PATH_RATE']
-    )
-    return model
-
-# 학습 함수 (Mixed Precision + Gradient Accumulation + Mixup/CutMix)
-def train_epoch(model, dataloader, criterion, optimizer, device, scaler, epoch, use_mixup=True):
+# ==================== Training Functions ====================
+def train_one_epoch(loader, model, optimizer, loss_fn, device, epoch, scaler, use_mixup=True):
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    train_loss = 0
+    preds_list = []
+    targets_list = []
 
     optimizer.zero_grad()
 
-    for batch_idx, (images, labels) in enumerate(dataloader):
-        images, labels = images.to(device), labels.to(device)
+    pbar = tqdm(loader, desc=f"Training Epoch {epoch}")
+    for batch_idx, (image, targets) in enumerate(pbar):
+        image = image.to(device)
+        targets = targets.to(device)
 
-        # Apply mixup/cutmix after warmup epochs
         if use_mixup:
-            mixed_images, labels_a, labels_b, lam = mixup_cutmix_data(
-                images, labels, alpha=0.4, cutmix_prob=0.5
+            mixed_image, targets_a, targets_b, lam = mixup_cutmix_data(
+                image, targets, alpha=0.3, cutmix_prob=0.5  # alpha 줄임
             )
         else:
-            mixed_images, labels_a, labels_b, lam = images, labels, labels, 1.0
+            mixed_image, targets_a, targets_b, lam = image, targets, targets, 1.0
 
-        # Mixed precision training
         with torch.cuda.amp.autocast():
-            outputs = model(mixed_images)
-            loss = mixed_criterion(criterion, outputs, labels_a, labels_b, lam)
-            loss = loss / CFG['GRADIENT_ACCUMULATION']
+            preds = model(mixed_image)
+            loss = mixed_criterion(loss_fn, preds, targets_a, targets_b, lam)
+            loss = loss / gradient_accumulation_steps
 
-        # Backward with gradient scaling
         scaler.scale(loss).backward()
 
-        # Gradient accumulation
-        if (batch_idx + 1) % CFG['GRADIENT_ACCUMULATION'] == 0:
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
 
-        running_loss += loss.item() * CFG['GRADIENT_ACCUMULATION']
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        train_loss += loss.item() * gradient_accumulation_steps
+        preds_list.extend(preds.argmax(dim=1).detach().cpu().numpy())
+        targets_list.extend(targets.detach().cpu().numpy())
 
-    epoch_loss = running_loss / len(dataloader)
-    epoch_acc = 100. * correct / total
-    return epoch_loss, epoch_acc
+        pbar.set_postfix({'loss': f'{loss.item() * gradient_accumulation_steps:.4f}'})
 
-# 검증 함수 (Mixed Precision)
-def validate_epoch(model, dataloader, criterion, device):
+    train_loss /= len(loader)
+    train_acc = accuracy_score(targets_list, preds_list)
+    train_f1 = f1_score(targets_list, preds_list, average='macro')
+
+    return {"train_loss": train_loss, "train_acc": train_acc, "train_f1": train_f1}
+
+def validate(loader, model, loss_fn, device):
     model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    val_loss = 0
+    preds_list = []
+    targets_list = []
 
+    pbar = tqdm(loader, desc="Validating")
     with torch.no_grad():
-        for images, labels in dataloader:
-            images, labels = images.to(device), labels.to(device)
+        for image, targets in pbar:
+            image = image.to(device)
+            targets = targets.to(device)
 
             with torch.cuda.amp.autocast():
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                preds = model(image)
+                loss = loss_fn(preds, targets)
 
-            running_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            val_loss += loss.item()
+            preds_list.extend(preds.argmax(dim=1).detach().cpu().numpy())
+            targets_list.extend(targets.detach().cpu().numpy())
 
-    epoch_loss = running_loss / len(dataloader)
-    epoch_acc = 100. * correct / total
-    return epoch_loss, epoch_acc
+    val_loss /= len(loader)
+    val_acc = accuracy_score(targets_list, preds_list)
+    val_f1 = f1_score(targets_list, preds_list, average='macro')
 
-# 예측 함수 (Mixed Precision)
-def predict(model, dataloader, device):
+    return {"val_loss": val_loss, "val_acc": val_acc, "val_f1": val_f1}, val_f1
+
+# ==================== TTA 함수 ====================
+def predict_with_tta(model, loader, device, n_tta=5):
+    """Test Time Augmentation으로 더 안정적인 예측"""
     model.eval()
-    predictions = []
-
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc='Predicting')
-        for images in pbar:
-            images = images.to(device)
-            with torch.cuda.amp.autocast():
-                outputs = model(images)
-            _, predicted = outputs.max(1)
-            predictions.extend(predicted.cpu().numpy())
-
-    return predictions
-
-# 로거 설정
-def setup_logger(exp_dir, timestamp):
-    log_file = os.path.join(exp_dir, f'train_{timestamp}.log')
-
-    # 로거 생성
-    logger = logging.getLogger('DocumentClassification')
-    logger.setLevel(logging.INFO)
-
-    # 파일 핸들러
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.INFO)
-
-    # 콘솔 핸들러
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-
-    # 포맷 설정
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-
-    # 핸들러 추가
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-
-    return logger
-
-# 메인 실행
-def main():
-    # 실험 폴더 생성
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    exp_dir = f"experiment_{timestamp}"
-    os.makedirs(exp_dir, exist_ok=True)
-
-    # 로거 설정
-    logger = setup_logger(exp_dir, timestamp)
-
-    logger.info(f"=" * 60)
-    logger.info(f"Experiment directory: {exp_dir}")
-    logger.info(f"Device: {CFG['DEVICE']}")
-    logger.info(f"Model: {CFG['MODEL_NAME']}")
-    logger.info(f"=" * 60)
-    logger.info(f"Configuration:")
-    for key, value in CFG.items():
-        logger.info(f"  {key}: {value}")
-
-    # 데이터 로드
-    train_df = pd.read_csv('./data/train.csv')
-    logger.info(f"Total training samples: {len(train_df)}")
-
-    # 클래스 분포 및 불균형 지수 계산
-    logger.info("\n" + "=" * 60)
-    logger.info("Class Distribution Analysis")
-    logger.info("=" * 60)
-
-    class_counts = train_df['target'].value_counts().sort_index()
-    for class_id, count in class_counts.items():
-        percentage = (count / len(train_df)) * 100
-        logger.info(f"Class {class_id}: {count} samples ({percentage:.2f}%)")
-
-    # Imbalance Ratio: 가장 많은 클래스 / 가장 적은 클래스
-    max_samples = class_counts.max()
-    min_samples = class_counts.min()
-    imbalance_ratio = max_samples / min_samples
-    logger.info("-" * 60)
-    logger.info(f"Max samples per class: {max_samples}")
-    logger.info(f"Min samples per class: {min_samples}")
-    logger.info(f"Imbalance Ratio (max/min): {imbalance_ratio:.2f}")
-
-    # Gini Coefficient (불균형 정도를 0~1로 표현, 0: 완벽한 균형, 1: 완전 불균형)
-    sorted_counts = np.sort(class_counts.values)
-    n = len(sorted_counts)
-    gini = (2 * np.sum((np.arange(1, n+1)) * sorted_counts)) / (n * np.sum(sorted_counts)) - (n + 1) / n
-    logger.info(f"Gini Coefficient: {gini:.4f}")
-    logger.info("=" * 60)
-
-    # K-Fold Cross Validation 설정
-    skf = StratifiedKFold(n_splits=CFG['N_FOLDS'], shuffle=True, random_state=CFG['SEED'])
-
-    fold_results = []
-    oof_predictions = np.zeros(len(train_df))
-    test_predictions_per_fold = []
-
-    # 각 Fold 학습
-    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df['target']), 1):
-        logger.info("\n" + "=" * 60)
-        logger.info(f"FOLD {fold}/{CFG['N_FOLDS']}")
-        logger.info("=" * 60)
-
-        # Train/Validation 데이터 분할
-        train_data = train_df.iloc[train_idx].reset_index(drop=True)
-        val_data = train_df.iloc[val_idx].reset_index(drop=True)
-        logger.info(f"Train samples: {len(train_data)}, Validation samples: {len(val_data)}")
-
-        # Dataset 생성
-        train_dataset = DocumentDataset(train_data, './data/train', transform=train_transform)
-        val_dataset = DocumentDataset(val_data, './data/train', transform=val_transform)
-
-        # DataLoader 생성
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=CFG['BATCH_SIZE'],
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=CFG['BATCH_SIZE'],
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
-        )
-
-        # 모델, 손실함수, 옵티마이저, 스케줄러 설정 (ViT Winner 기반)
-        model = get_model().to(CFG['DEVICE'])
-        criterion = nn.CrossEntropyLoss(label_smoothing=CFG['LABEL_SMOOTHING'])  # Label smoothing
-        optimizer = optim.AdamW(model.parameters(), lr=CFG['LR'], weight_decay=0.01)
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-7)
-
-        # Mixed precision scaler
-        scaler = torch.cuda.amp.GradScaler()
-
-        # 학습
-        logger.info(f"Starting training for Fold {fold}...")
-        logger.info(f"  - Effective batch size: {CFG['BATCH_SIZE'] * CFG['GRADIENT_ACCUMULATION']}")
-        logger.info(f"  - Mixup/CutMix starts after epoch {CFG['WARMUP_EPOCHS']}")
-        best_val_acc = 0.0
-        patience_counter = 0
-
-        for epoch in range(CFG['EPOCHS']):
-            logger.info(f"\nFold {fold} - Epoch {epoch+1}/{CFG['EPOCHS']}")
-            logger.info("-" * 50)
-
-            # Apply mixup/cutmix after warmup
-            use_mixup = epoch >= CFG['WARMUP_EPOCHS']
-            train_loss, train_acc = train_epoch(
-                model, train_loader, criterion, optimizer, CFG['DEVICE'], scaler, epoch, use_mixup
-            )
-            val_loss, val_acc = validate_epoch(model, val_loader, criterion, CFG['DEVICE'])
-            scheduler.step()
-
-            logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            logger.info(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
-            logger.info(f"LR: {scheduler.get_last_lr()[0]:.6f}")
-
-            # 최고 성능 모델 저장 및 Early Stopping
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                patience_counter = 0
-                model_path = os.path.join(exp_dir, f'best_model_fold{fold}.pth')
-                torch.save(model.state_dict(), model_path)
-                logger.info(f"Best model for Fold {fold} saved! (Val Acc: {val_acc:.2f}%)")
-            else:
-                patience_counter += 1
-                logger.info(f"No improvement. Patience: {patience_counter}/{CFG['PATIENCE']}")
-
-            # Early Stopping 체크
-            if patience_counter >= CFG['PATIENCE']:
-                logger.info(f"Early stopping triggered after {epoch+1} epochs")
-                break
-
-        logger.info(f"\nFold {fold} training completed! Best validation accuracy: {best_val_acc:.2f}%")
-
-        # Validation 데이터로 F1 Score 계산
-        logger.info(f"Calculating F1 score for Fold {fold}...")
-        model_path = os.path.join(exp_dir, f'best_model_fold{fold}.pth')
-        model.load_state_dict(torch.load(model_path))
-        model.eval()
-
-        val_preds = []
-        val_labels = []
+    
+    # TTA transforms
+    tta_transforms = [
+        val_transform,  # Original
+        A.Compose([
+            A.Resize(height=img_size, width=img_size),
+            A.HorizontalFlip(p=1.0),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ]),
+        A.Compose([
+            A.Resize(height=img_size, width=img_size),
+            A.VerticalFlip(p=1.0),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ]),
+        A.Compose([
+            A.Resize(height=img_size, width=img_size),
+            A.Rotate(limit=90, p=1.0, border_mode=cv2.BORDER_CONSTANT, value=(255,255,255)),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ]),
+        A.Compose([
+            A.Resize(height=img_size, width=img_size),
+            A.Rotate(limit=-90, p=1.0, border_mode=cv2.BORDER_CONSTANT, value=(255,255,255)),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ]),
+    ]
+    
+    all_tta_preds = []
+    
+    for tta_idx in range(min(n_tta, len(tta_transforms))):
+        # Create new dataset with TTA transform
+        tta_dataset = ImageDataset(test_csv, test_folder, transform=tta_transforms[tta_idx])
+        tta_loader = DataLoader(tta_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                               num_workers=num_workers, pin_memory=True)
+        
+        tta_preds = []
         with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc=f'Fold {fold} - Calculating F1'):
-                images = images.to(CFG['DEVICE'])
-                outputs = model(images)
-                _, predicted = outputs.max(1)
-                val_preds.extend(predicted.cpu().numpy())
-                val_labels.extend(labels.numpy())
+            for image, _ in tta_loader:
+                image = image.to(device)
+                with torch.cuda.amp.autocast():
+                    preds = model(image)
+                    probs = torch.softmax(preds, dim=1)
+                tta_preds.append(probs.cpu().numpy())
+        
+        tta_preds = np.concatenate(tta_preds, axis=0)
+        all_tta_preds.append(tta_preds)
+    
+    # Average TTA predictions
+    avg_tta_preds = np.mean(all_tta_preds, axis=0)
+    return avg_tta_preds
 
-        fold_f1 = f1_score(val_labels, val_preds, average='macro')
-        logger.info(f"Fold {fold} - Validation F1 Score (macro): {fold_f1:.4f}")
+# ==================== Data Augmentation ====================
+print("\n[AUGMENTATION] Setting up transformations...")
 
-        # OOF 예측 저장
-        oof_predictions[val_idx] = val_preds
+# 약간 더 보수적인 augmentation
+trn_transform = A.Compose([
+    A.Resize(height=img_size, width=img_size),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.Rotate(limit=180, p=0.7, border_mode=cv2.BORDER_CONSTANT, value=(255, 255, 255)),
+    A.ShiftScaleRotate(
+        shift_limit=0.08,
+        scale_limit=0.12,
+        rotate_limit=25,
+        p=0.5,
+        border_mode=cv2.BORDER_CONSTANT,
+        value=(255, 255, 255)
+    ),
+    A.OneOf([
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
+        A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=15, p=1.0),
+    ], p=0.4),
+    A.OneOf([
+        A.GaussNoise(var_limit=(10.0, 25.0), p=1.0),
+        A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+    ], p=0.25),
+    A.CoarseDropout(
+        max_holes=6,
+        max_height=28,
+        max_width=28,
+        min_holes=1,
+        fill_value=255,
+        p=0.25
+    ),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
+])
 
-        # Fold 결과 저장
-        fold_results.append({
-            'fold': fold,
-            'val_acc': best_val_acc,
-            'val_f1': fold_f1
-        })
+val_transform = A.Compose([
+    A.Resize(height=img_size, width=img_size),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ToTensorV2(),
+])
 
-        # 테스트 데이터 예측 (각 Fold)
-        logger.info(f"Generating test predictions for Fold {fold}...")
-        test_files = sorted(os.listdir('./data/test'))
+# ==================== K-Fold Cross Validation ====================
+print("\n" + "="*80)
+print("STARTING K-FOLD CROSS VALIDATION")
+print("="*80)
 
-        class TestDataset(Dataset):
-            def __init__(self, file_list, img_dir, transform=None):
-                self.file_list = file_list
-                self.img_dir = img_dir
-                self.transform = transform
+start_time = time.time()
 
-            def __len__(self):
-                return len(self.file_list)
+full_dataset = ImageDataset(train_csv, train_folder, transform=trn_transform)
+X = full_dataset.df[:, 0]
+y = full_dataset.df[:, 1].astype(int)
 
-            def __getitem__(self, idx):
-                img_path = os.path.join(self.img_dir, self.file_list[idx])
-                image = np.array(Image.open(img_path).convert('RGB'))
-                if self.transform:
-                    image = self.transform(image=image)['image']
-                return image
+print(f"\nDataset size: {len(full_dataset)}")
+print(f"Number of classes: 17")
 
-        test_dataset = TestDataset(test_files, './data/test', transform=test_transform)
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=CFG['BATCH_SIZE'],
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True
+# 클래스 분포 확인
+class_counts = pd.Series(y).value_counts().sort_index()
+print("\nClass distribution:")
+for cls in range(17):
+    count = class_counts.get(cls, 0)
+    print(f"  Class {cls:2d}: {count:4d} samples")
+
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
+
+all_fold_f1_scores = []
+fold_confidences = []  # 각 fold의 confidence 저장
+
+for fold, (train_index, valid_index) in enumerate(skf.split(X, y)):
+    print(f"\n{'='*80}")
+    print(f"FOLD {fold + 1}/{n_splits}")
+    print(f"{'='*80}")
+
+    train_dataset = ImageDataset(train_csv, train_folder, transform=trn_transform)
+    valid_dataset = ImageDataset(train_csv, train_folder, transform=val_transform)
+
+    train_subset = torch.utils.data.Subset(train_dataset, train_index)
+    valid_subset = torch.utils.data.Subset(valid_dataset, valid_index)
+
+    train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=num_workers, pin_memory=True)
+    valid_loader = DataLoader(valid_subset, batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=num_workers, pin_memory=True)
+
+    print(f"Train samples: {len(train_subset)}, Valid samples: {len(valid_subset)}")
+
+    # Create model
+    print(f"\nCreating {model_name}...")
+    model = timm.create_model(
+        model_name,
+        pretrained=True,
+        num_classes=17,
+        drop_rate=0.15,  # dropout 약간 증가
+        drop_path_rate=0.15,
+    )
+    model = model.to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+    # Focal Loss 사용
+    loss_fn = FocalLoss(alpha=1.0, gamma=2.0)
+
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.02)  # weight decay 증가
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=8, T_mult=1, eta_min=1e-7)
+    scaler = torch.cuda.amp.GradScaler()
+
+    best_val_f1 = 0
+    patience = 10  # patience 줄임
+    patience_counter = 0
+
+    for epoch in range(1, EPOCHS + 1):
+        print(f"\nEpoch {epoch}/{EPOCHS} (LR: {optimizer.param_groups[0]['lr']:.7f})")
+
+        train_metrics = train_one_epoch(
+            train_loader, model, optimizer, loss_fn, device, epoch, scaler,
+            use_mixup=(epoch > warmup_epochs)
         )
 
-        fold_test_preds = predict(model, test_loader, CFG['DEVICE'])
-        test_predictions_per_fold.append(fold_test_preds)
+        val_metrics, val_f1 = validate(valid_loader, model, loss_fn, device)
+        scheduler.step()
 
-    # 전체 Fold 결과 요약
-    logger.info("\n" + "=" * 60)
-    logger.info("K-FOLD CROSS VALIDATION RESULTS")
-    logger.info("=" * 60)
-    for result in fold_results:
-        logger.info(f"Fold {result['fold']}: Val Acc = {result['val_acc']:.2f}%, Val F1 = {result['val_f1']:.4f}")
+        print(f"Train - Loss: {train_metrics['train_loss']:.4f}, "
+              f"Acc: {train_metrics['train_acc']:.4f}, F1: {train_metrics['train_f1']:.4f}")
+        print(f"Valid - Loss: {val_metrics['val_loss']:.4f}, "
+              f"Acc: {val_metrics['val_acc']:.4f}, F1: {val_metrics['val_f1']:.4f}")
 
-    avg_acc = np.mean([r['val_acc'] for r in fold_results])
-    avg_f1 = np.mean([r['val_f1'] for r in fold_results])
-    logger.info("-" * 60)
-    logger.info(f"Average Val Acc: {avg_acc:.2f}%")
-    logger.info(f"Average Val F1: {avg_f1:.4f}")
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
 
-    # OOF F1 Score
-    oof_f1 = f1_score(train_df['target'].values, oof_predictions, average='macro')
-    logger.info(f"OOF F1 Score: {oof_f1:.4f}")
-    logger.info("=" * 60)
+            model_filename = os.path.join(model_save_path, f'model_fold{fold}_best.pkl')
+            with open(model_filename, 'wb') as f:
+                pickle.dump(model, f)
 
-    # 최종 F1은 OOF F1 사용
-    f1 = oof_f1
+            print(f"✓ Best F1 improved: {best_val_f1:.4f} - Model saved")
+        else:
+            patience_counter += 1
+            print(f"Patience: {patience_counter}/{patience}")
 
-    # 테스트 데이터 앙상블 예측 (모든 Fold의 평균)
-    logger.info("\n" + "=" * 60)
-    logger.info("Generating final ensemble predictions...")
-    test_files = sorted(os.listdir('./data/test'))
+        if patience_counter >= patience:
+            print(f"\nEarly stopping at epoch {epoch}")
+            break
 
-    # 모든 fold의 예측을 평균내어 최종 예측 생성
-    ensemble_predictions = np.array(test_predictions_per_fold).mean(axis=0).astype(int)
-    predictions = ensemble_predictions
+    all_fold_f1_scores.append(best_val_f1)
+    fold_confidences.append(best_val_f1)  # F1을 confidence로 사용
+    
+    print(f"\n{'='*80}")
+    print(f"FOLD {fold + 1} COMPLETE - Best F1: {best_val_f1:.4f}")
+    print(f"{'='*80}")
 
-    # Submission 파일 생성
-    submission = pd.DataFrame({
-        'ID': test_files,
-        'target': predictions
-    })
-    submission_filename = f"submission_{timestamp}_f1_{f1:.4f}.csv"
-    submission_path = os.path.join(exp_dir, submission_filename)
-    submission.to_csv(submission_path, index=False)
-    logger.info(f"Submission file saved as '{submission_path}'")
-    logger.info("=" * 60)
-    logger.info("Experiment completed successfully!")
-    logger.info("=" * 60)
+# ==================== Summary ====================
+elapsed_time = time.time() - start_time
 
-if __name__ == '__main__':
-    main()
+print("\n" + "="*80)
+print("CROSS VALIDATION COMPLETE")
+print("="*80)
+
+mean_f1 = np.mean(all_fold_f1_scores)
+std_f1 = np.std(all_fold_f1_scores)
+
+print(f"\nResults per fold:")
+for i, f1 in enumerate(all_fold_f1_scores):
+    print(f"  Fold {i+1}: F1 = {f1:.4f}")
+
+print(f"\nOverall Performance:")
+print(f"  Mean F1: {mean_f1:.4f} ± {std_f1:.4f}")
+print(f"  Training time: {elapsed_time/60:.1f} minutes")
+
+print("\n" + "="*80)
+print("GENERATING PREDICTIONS WITH TTA")
+print("="*80)
+
+# Confidence weights 계산
+confidence_weights = np.array(fold_confidences)
+confidence_weights = confidence_weights / confidence_weights.sum()
+
+print(f"\nConfidence weights:")
+for i, w in enumerate(confidence_weights):
+    print(f"  Fold {i+1}: {w:.4f}")
+
+# TTA를 사용한 앙상블 예측
+all_predictions = []
+
+for fold in range(n_splits):
+    print(f"\nPredicting with Fold {fold + 1} model (with TTA)...")
+
+    model_file = os.path.join(model_save_path, f'model_fold{fold}_best.pkl')
+    with open(model_file, 'rb') as f:
+        model = pickle.load(f)
+
+    model.to(device)
+    
+    # TTA 적용
+    fold_preds = predict_with_tta(model, None, device, n_tta=TTA_TRANSFORMS)
+    all_predictions.append(fold_preds)
+
+# Confidence-weighted ensemble
+print("\nApplying confidence-weighted ensemble...")
+weighted_preds = np.zeros_like(all_predictions[0])
+for fold_pred, weight in zip(all_predictions, confidence_weights):
+    weighted_preds += fold_pred * weight
+
+final_preds = np.argmax(weighted_preds, axis=1)
+
+# Calculate imbalance
+pred_counts = pd.Series(final_preds).value_counts().sort_index()
+imbalance = pred_counts.max() / pred_counts.min()
+print(f"\nPrediction imbalance: {imbalance:.2f}x")
+print(f"\nClass distribution:")
+for cls in range(17):
+    count = pred_counts.get(cls, 0)
+    print(f"  Class {cls:2d}: {count:4d} samples")
+
+# Save submission
+pred_df = pd.DataFrame(pd.read_csv(test_csv).values, columns=['ID', 'target'])
+pred_df['target'] = final_preds
+
+now = datetime.now()
+date_str = now.strftime("%Y%m%d")
+time_str = now.strftime("%H%M%S")
+f1_str = f"{mean_f1:.4f}".replace(".", "")
+imb_str = f"{imbalance:.2f}".replace(".", "")
+
+filename = f"submission_{date_str}_{time_str}_vitbase384opt_f1{f1_str}_imb{imb_str}_tta{TTA_TRANSFORMS}.csv"
+pred_df.to_csv(f"./data/{filename}", index=False)
+
+print(f"\n✓ Predictions saved to ./data/{filename}")
+
+print("\n" + "="*80)
+print("🎉 OPTIMIZED ViT-BASE-384 TRAINING COMPLETE!")
+print("="*80)
+print(f"Mean F1 Score: {mean_f1:.4f} ± {std_f1:.4f}")
+print(f"Prediction Imbalance: {imbalance:.2f}x")
+print(f"TTA Transforms: {TTA_TRANSFORMS}")
+print(f"Total Time: {elapsed_time/60:.1f} minutes")
+print(f"Models saved to: {model_save_path}")
+print(f"Submission file: ./data/{filename}")
+print("="*80)
